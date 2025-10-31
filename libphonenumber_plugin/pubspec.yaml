@@ -17,13 +17,13 @@ dependencies:
   libphonenumber_platform_interface:
     git:
       ref: pi_v2
-      url: https://github.com/rahulraj-idt/plugin_libphonenumber.git
+      url: https://github.com/coretech/plugin_libphonenumber.git
       path: libphonenumber_platform_interface
 
   libphonenumber_web:
     git:
       ref: idtm
-      url: https://github.com/rahulraj-idt/plugin_libphonenumber.git
+      url: https://github.com/coretech/plugin_libphonenumber.git
       path: libphonenumber_web
 
 dev_dependencies:
