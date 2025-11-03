@@ -18,7 +18,7 @@ dependencies:
   libphonenumber_platform_interface:
     git:
       ref: pi_v1
-      url: git@github.com:rahulraj-idt/plugin_libphonenumber.git
+      url: https://github.com/coretech/plugin_libphonenumber.git
       path: libphonenumber_platform_interface
 
 dev_dependencies:
