@@ -6,8 +6,31 @@ public class SwiftLibphonenumberPlugin: NSObject, FlutterPlugin {
 
     let phoneNumberUtility = PhoneNumberUtility()
 
+    /// The regions libphonenumber has metadata for.
+    ///
+    /// `allCountries()` builds and returns the whole list on every call, and
+    /// the region check in `parsePhoneNumber` runs on every single parse, so
+    /// resolving an address book used to rebuild this list once per number.
+    /// Cache it once and look it up as a set.
+    lazy var supportedRegions: Set<String> = Set(phoneNumberUtility.allCountries())
+
     public static func register(with registrar: FlutterPluginRegistrar) {
-        let channel = FlutterMethodChannel(name: "plugin.libphonenumber", binaryMessenger: registrar.messenger())
+        // Serve this channel on a background task queue instead of the main
+        // queue. Every method below runs PhoneNumberKit synchronously inside
+        // the handler, so resolving an address book of several hundred numbers
+        // used to occupy the thread that drives the UI for as long as the work
+        // took. Nothing here touches UIKit, and the queue is serial, so the
+        // shared plugin instance is never accessed concurrently.
+        //
+        // `makeBackgroundTaskQueue` is optional in the messenger protocol, so
+        // a nil result simply keeps the previous main-queue behaviour.
+        let messenger = registrar.messenger()
+        let channel = FlutterMethodChannel(
+            name: "plugin.libphonenumber",
+            binaryMessenger: messenger,
+            codec: FlutterStandardMethodCodec.sharedInstance(),
+            taskQueue: messenger.makeBackgroundTaskQueue?()
+        )
 
         let instance = SwiftLibphonenumberPlugin()
         registrar.addMethodCallDelegate(instance, channel: channel)
@@ -39,8 +62,65 @@ public class SwiftLibphonenumberPlugin: NSObject, FlutterPlugin {
         case "parse":
             parsePhoneNumber(call: call, result: result)
             break
+        case "getNumbersDetails":
+            getNumbersDetails(call: call, result: result)
+            break
         default:
             result(FlutterMethodNotImplemented)
+        }
+    }
+
+    /// Resolves a whole list of phone numbers in a single platform call.
+    ///
+    /// A caller that normalises an address book needs the E.164 form, the
+    /// region and the display formats of every number. Asking for those one
+    /// method at a time costs three round trips per number and parses the same
+    /// number three times. Here each number is parsed once and every
+    /// representation travels back in one response.
+    ///
+    /// Expects `numbers`: a list of maps holding `phoneNumber` and `isoCode`.
+    /// Returns one map per input, in the same order. A number that cannot be
+    /// parsed yields a map holding only `error`, so a single malformed contact
+    /// never fails the batch.
+    func getNumbersDetails(call: FlutterMethodCall, result: @escaping FlutterResult) {
+        let arguments = call.arguments as? Dictionary<String, Any>
+        let numbers = arguments?["numbers"] as? [[String: Any]] ?? []
+
+        let details: [[String: String?]] = numbers.map { number in
+            numberDetails(
+                number["phoneNumber"] as? String ?? "",
+                withRegion: number["isoCode"] as? String ?? ""
+            )
+        }
+
+        result(details)
+    }
+
+    /// Every representation of [phoneNumber] that the single-number methods can
+    /// produce, derived from one parse. Formatting an already parsed number is
+    /// an in-memory operation, so the extra representations are free compared
+    /// to the parse itself.
+    private func numberDetails(_ phoneNumber: String, withRegion isoCode: String) -> [String: String?] {
+        do {
+            let p: PhoneNumber = try parsePhoneNumber(phoneNumber, withRegion: isoCode.uppercased(), ignoreType: true)
+            let regionCode: String? = phoneNumberUtility.getRegionCode(of: p)
+            let countryCode: String?
+
+            if let prefix = phoneNumberUtility.countryCode(for: regionCode ?? "") {
+                countryCode = String(prefix)
+            } else {
+                countryCode = nil
+            }
+
+            return [
+                "e164": phoneNumberUtility.format(p, toType: PhoneNumberFormat.e164),
+                "isoCode": regionCode,
+                "regionCode": countryCode,
+                "national": phoneNumberUtility.format(p, toType: PhoneNumberFormat.national),
+                "international": phoneNumberUtility.format(p, toType: PhoneNumberFormat.international),
+            ]
+        } catch let error as NSError {
+            return ["error": error.localizedDescription]
         }
     }
 
@@ -181,9 +261,10 @@ public extension SwiftLibphonenumberPlugin {
 
     private func parsePhoneNumber(_ phonenumber: String, withRegion regionCode: String, ignoreType: Bool = true) throws -> PhoneNumber {
         do {
-            let allSupportedCountries = phoneNumberUtility.allCountries()
-
-            if (regionCode.isEmpty == false && allSupportedCountries.contains(regionCode)) {
+            // `supportedRegions` is cached on the instance: this check runs on
+            // every parse, and rebuilding the region list here made the cost of
+            // resolving an address book grow with the number of contacts.
+            if (regionCode.isEmpty == false && supportedRegions.contains(regionCode)) {
                 return try phoneNumberUtility.parse(phonenumber, withRegion: regionCode, ignoreType: ignoreType)
             } else {
                 return try phoneNumberUtility.parse(phonenumber, ignoreType: ignoreType)
