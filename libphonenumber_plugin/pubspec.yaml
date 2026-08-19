@@ -6,7 +6,10 @@ publish_to: none
 
 environment:
   sdk: '>=2.17.0 <3.0.0'
-  flutter: ">=1.20.0"
+  # Background platform channels (BinaryMessenger.makeBackgroundTaskQueue) are
+  # used to keep libphonenumber off the UI thread, so the embedding has to be
+  # recent enough to provide them.
+  flutter: ">=3.0.0"
 
 dependencies:
   flutter:
