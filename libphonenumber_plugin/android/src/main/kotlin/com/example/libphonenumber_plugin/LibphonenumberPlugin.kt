@@ -1,5 +1,6 @@
 package com.example.libphonenumber_plugin
 
+import android.util.Log
 import com.google.i18n.phonenumbers.NumberParseException
 import com.google.i18n.phonenumbers.PhoneNumberUtil
 import com.google.i18n.phonenumbers.PhoneNumberUtil.PhoneNumberFormat
@@ -83,7 +84,16 @@ class LibphonenumberPlugin : FlutterPlugin, MethodCallHandler {
    */
   private fun handleGetNumbersDetails(call: MethodCall, result: MethodChannel.Result) {
     val numbers = call.argument<List<Map<String, String>>>("numbers") ?: emptyList()
-    result.success(numbersDetails(numbers))
+    val startNanos = System.nanoTime()
+    val details = numbersDetails(numbers)
+    val elapsedMs = (System.nanoTime() - startNanos) / 1_000_000
+    // Counts and timing only, never the numbers themselves (PII, DCS-5281).
+    // This is the native half of the BAT-9823 timing: a Dart-side stopwatch
+    // around the channel call minus this value is the codec, task-queue and
+    // event-loop overhead of the platform round trip.
+    val unparsed = details.count { it.containsKey("error") }
+    Log.d(TAG, "getNumbersDetails: ${numbers.size} numbers in ${elapsedMs}ms ($unparsed unparsed)")
+    result.success(details)
   }
 
   /**
@@ -273,6 +283,8 @@ class LibphonenumberPlugin : FlutterPlugin, MethodCallHandler {
   }
 
   companion object {
+    private const val TAG = "LibphonenumberPlugin"
+
     private val phoneUtil = PhoneNumberUtil.getInstance()
 
     /** Below this size a batch is resolved inline: pooling has no win to offer. */
