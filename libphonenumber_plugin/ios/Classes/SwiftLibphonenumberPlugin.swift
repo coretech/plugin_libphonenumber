@@ -1,3 +1,4 @@
+import Contacts
 import Flutter
 import UIKit
 import PhoneNumberKit
@@ -65,6 +66,9 @@ public class SwiftLibphonenumberPlugin: NSObject, FlutterPlugin {
         case "getNumbersDetails":
             getNumbersDetails(call: call, result: result)
             break
+        case "addressBookRegionCounts":
+            addressBookRegionCounts(call: call, result: result)
+            break
         default:
             result(FlutterMethodNotImplemented)
         }
@@ -122,6 +126,116 @@ public class SwiftLibphonenumberPlugin: NSObject, FlutterPlugin {
         } catch let error as NSError {
             return ["error": error.localizedDescription]
         }
+    }
+
+    /// Counts the address book's contacts per region of their FIRST phone
+    /// number, without handing a single number to Dart (BAT-9824). The Android
+    /// implementation documents the rationale; the two must stay in step.
+    ///
+    /// Mirrors the Dart ranking's input number by number: iOS has no
+    /// provider-side E.164 normalisation, so the raw number is stripped to
+    /// digits and a leading `+` (Arabic-Indic digits folded, `*`/`#` end it);
+    /// a digit-led string without an exit code gets a `+`; one with an exit
+    /// code is parsed under the caller's `isoCode`, the user's country, as the
+    /// Dart fallback pass does; a parsed number with no region falls back to
+    /// its calling code's main country. Answers nil without contacts access,
+    /// or when the store fails, so the caller keeps its fallback. Otherwise
+    /// `counts` (lowercase ISO region → contacts) and `contacts` (how many
+    /// first numbers were parsed).
+    func addressBookRegionCounts(call: FlutterMethodCall, result: @escaping FlutterResult) {
+        guard hasContactsAccess() else {
+            result(nil)
+            return
+        }
+        let arguments = call.arguments as? Dictionary<String, Any>
+        let region = (arguments?["isoCode"] as? String ?? "")
+            .trimmingCharacters(in: .whitespaces)
+            .uppercased()
+        let request = CNContactFetchRequest(keysToFetch: [CNContactPhoneNumbersKey as CNKeyDescriptor])
+        var counts: [String: Int] = [:]
+        var contacts = 0
+        do {
+            try CNContactStore().enumerateContacts(with: request) { contact, _ in
+                guard let number = self.parseInput(contact.phoneNumbers.first?.value.stringValue) else {
+                    return
+                }
+                contacts += 1
+                if let iso = self.regionOf(number, withRegion: region) {
+                    counts[iso, default: 0] += 1
+                }
+            }
+        } catch {
+            result(nil)
+            return
+        }
+        result(["counts": counts, "contacts": contacts])
+    }
+
+    /// Full access or, on iOS 18+, limited access: a limited book is still
+    /// the book the Dart side sees, so the ranking stays consistent with it.
+    private func hasContactsAccess() -> Bool {
+        let status = CNContactStore.authorizationStatus(for: .contacts)
+        if status == .authorized {
+            return true
+        }
+        if #available(iOS 18.0, *), status == .limited {
+            return true
+        }
+        return false
+    }
+
+    /// International exit codes the Dart side's `addPlusIfMissing` recognises:
+    /// a digit-led number starting with one is dialled, not international.
+    private static let exitCodes = ["00", "0011", "000", "009", "011"]
+
+    /// The string the Dart pipeline hands libphonenumber for this number, or
+    /// nil when it hands nothing (no digits at all).
+    private func parseInput(_ raw: String?) -> String? {
+        guard let raw = raw else {
+            return nil
+        }
+        let stripped = stripToMsisdn(raw)
+        if stripped.isEmpty {
+            return nil
+        }
+        if stripped.hasPrefix("+") {
+            return stripped
+        }
+        return Self.exitCodes.contains(where: { stripped.hasPrefix($0) }) ? stripped : "+" + stripped
+    }
+
+    /// Digits and a leading `+`; `*` and `#` end the number; Arabic-Indic
+    /// digits fold to ASCII. The Dart side's
+    /// `idtm_stringByRemovingNonMSISDNCharacters` after `replaceArabicNumber`.
+    private func stripToMsisdn(_ value: String) -> String {
+        var out = ""
+        for (index, c) in value.enumerated() {
+            if c == "*" || c == "#" {
+                break
+            }
+            if c == "+" && index == 0 {
+                out.append(c)
+            } else if let ascii = c.asciiValue, ascii >= 48, ascii <= 57 {
+                out.append(c)
+            } else if let scalar = c.unicodeScalars.first, scalar.value >= 0x0660, scalar.value <= 0x0669 {
+                out.append(Character(UnicodeScalar(UInt8(48 + scalar.value - 0x0660))))
+            }
+        }
+        return out
+    }
+
+    /// Lowercase ISO region of [number] parsed under [region] (ignored for a
+    /// number with `+`), or nil when it cannot be parsed. A parsed number with
+    /// no region falls back to its calling code's main country, like the Dart
+    /// dial-code table.
+    private func regionOf(_ number: String, withRegion region: String) -> String? {
+        guard let parsed = try? parsePhoneNumber(number, withRegion: region) else {
+            return nil
+        }
+        if let iso = phoneNumberUtility.getRegionCode(of: parsed) {
+            return iso.lowercased()
+        }
+        return phoneNumberUtility.mainCountry(forCode: parsed.countryCode)?.lowercased()
     }
 
     func parsePhoneNumber(call: FlutterMethodCall, result: @escaping FlutterResult) {

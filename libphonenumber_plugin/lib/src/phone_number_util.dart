@@ -129,6 +129,45 @@ class PhoneNumberUtil {
     return _numbersDetailsFallback(numbers);
   }
 
+  /// Contacts per region of their FIRST phone number, straight from the
+  /// address book: `{'us': 1200, 'jm': 300}`, ISO codes lowercased.
+  ///
+  /// The engager `ab_countries` ranking needs only these counts. Deriving
+  /// them from a full address-book fetch costs the whole book travelling to
+  /// Dart and every number a platform round trip; the native side instead
+  /// reads the phone table with the columns it needs and resolves the first
+  /// number of each contact in place, so no number ever reaches Dart
+  /// (BAT-9824). The Android and iOS implementations mirror the Dart ranking's
+  /// input, so both agree on the top countries.
+  ///
+  /// [defaultRegion] is the region a number without `+` is parsed under (the
+  /// user's country, as the Dart parser's own fallback pass uses); it is
+  /// ignored for numbers with `+`.
+  ///
+  /// Null when the counts are unavailable — web, a native side that predates
+  /// the call, no contacts permission, a provider failure — so the caller
+  /// keeps whatever fallback it has. Never throws.
+  static Future<Map<String, int>?> addressBookRegionCounts({required String defaultRegion}) async {
+    if (kIsWeb) {
+      return null;
+    }
+    try {
+      final response = await _channel.invokeMapMethod<Object?, Object?>(
+        'addressBookRegionCounts',
+        <String, dynamic>{'isoCode': defaultRegion},
+      );
+      final counts = response?['counts'] as Map<Object?, Object?>?;
+      if (counts == null) {
+        return null;
+      }
+      return counts.map((key, value) => MapEntry(key as String, (value as num).toInt()));
+    } on MissingPluginException {
+      return null; // Native side does not implement the call yet.
+    } on PlatformException {
+      return null; // Never let a platform-level failure take the caller down.
+    }
+  }
+
   static Future<List<Map<String, String?>>> _numbersDetailsFallback(
     List<Map<String, String>> numbers,
   ) async {

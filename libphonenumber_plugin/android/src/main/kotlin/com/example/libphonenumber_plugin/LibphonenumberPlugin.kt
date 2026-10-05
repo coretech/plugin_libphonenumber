@@ -1,5 +1,10 @@
 package com.example.libphonenumber_plugin
 
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
+import android.provider.ContactsContract.CommonDataKinds.Phone
 import android.util.Log
 import com.google.i18n.phonenumbers.NumberParseException
 import com.google.i18n.phonenumbers.PhoneNumberUtil
@@ -26,6 +31,11 @@ class LibphonenumberPlugin : FlutterPlugin, MethodCallHandler {
   /// This local reference serves to register the plugin with the Flutter Engine and unregister it
   /// when the Flutter Engine is detached from the Activity
   private var channel: MethodChannel? = null
+
+  /// Application context, needed only by [handleAddressBookRegionCounts] to
+  /// reach the contacts provider. Never an Activity, so it is safe to hold.
+  private var context: Context? = null
+
   override fun onAttachedToEngine(flutterPluginBinding: FlutterPluginBinding) {
     // Serve this channel on a background task queue instead of the platform
     // thread. Every method below runs libphonenumber synchronously inside the
@@ -33,10 +43,12 @@ class LibphonenumberPlugin : FlutterPlugin, MethodCallHandler {
     // drives the UI, so resolving an address book of several hundred numbers
     // used to stall frame production for as long as the work took.
     //
-    // Nothing here touches an Activity, a Context or a View, so there is no
-    // reason for the work to sit on the UI thread. The shared `phoneUtil` is
-    // documented as thread safe and `AsYouTypeFormatter` is created per call,
-    // so a background queue introduces no shared mutable state.
+    // Nothing here touches an Activity or a View, so there is no reason for
+    // the work to sit on the UI thread; the contacts provider query is a
+    // blocking read that belongs off it. The shared `phoneUtil` is documented
+    // as thread safe and `AsYouTypeFormatter` is created per call, so a
+    // background queue introduces no shared mutable state.
+    context = flutterPluginBinding.applicationContext
     val messenger = flutterPluginBinding.binaryMessenger
     channel = MethodChannel(
       messenger,
@@ -49,6 +61,7 @@ class LibphonenumberPlugin : FlutterPlugin, MethodCallHandler {
 
   override fun onDetachedFromEngine(binding: FlutterPluginBinding) {
     channel!!.setMethodCallHandler(null)
+    context = null
   }
 
   override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
@@ -62,8 +75,174 @@ class LibphonenumberPlugin : FlutterPlugin, MethodCallHandler {
       "getFormattedExampleNumber" -> handleGetFormattedExampleNumber(call, result)
       "parse" -> handleParse(call, result)
       "getNumbersDetails" -> handleGetNumbersDetails(call, result)
+      "addressBookRegionCounts" -> handleAddressBookRegionCounts(call, result)
       else -> result.notImplemented()
     }
+  }
+
+  /**
+   * Counts the address book's contacts per region of their FIRST phone
+   * number, without handing a single number to Dart.
+   *
+   * The engager `ab_countries` ranking needs only "how many contacts have
+   * their first number in each country". Deriving that from a full address
+   * book fetch costs the whole book (every property group) travelling to Dart
+   * and every number a platform round trip to be parsed. Here the phone table
+   * is read with three columns, the first number of each contact is resolved
+   * to its region with libphonenumber on this background queue, and only the
+   * counts travel back (BAT-9824).
+   *
+   * Mirrors the Dart ranking's input number by number, so both yield the same
+   * top countries (the Dart side checks parity in debug builds):
+   * - the first number is the primary one, then the lowest data id — the
+   *   order flutter_contacts presents them in;
+   * - the string is the provider's E.164 normalisation when it has one, else
+   *   the raw number; Arabic-Indic digits become ASCII, everything but digits
+   *   and a leading `+` is dropped, `*` and `#` end the number;
+   * - a digit-led string without an exit code (00, 011, …) is taken as
+   *   international and gets a `+`; one with an exit code is parsed under the
+   *   caller's `isoCode` — the user's country, as the Dart fallback pass does —
+   *   which is how `011 212 …` resolves to Morocco for a US user;
+   * - a number libphonenumber parses but assigns no region falls back to the
+   *   main region of its calling code, the closest native equivalent of the
+   *   Dart dial-code table.
+   *
+   * Expects `isoCode`: the region for numbers without `+` (may be empty).
+   * Answers null without READ_CONTACTS, or when the provider fails, so the
+   * caller keeps its fallback. Otherwise a map with `counts` (lowercase ISO
+   * region → contacts) and `contacts` (how many first numbers were parsed).
+   */
+  private fun handleAddressBookRegionCounts(call: MethodCall, result: MethodChannel.Result) {
+    val context = this.context
+    if (context == null || !hasReadContactsPermission(context)) {
+      result.success(null)
+      return
+    }
+    val region = call.argument<String>("isoCode")
+      ?.trim()
+      ?.uppercase(Locale.ROOT)
+      ?.takeIf { it.isNotEmpty() }
+      ?: UNKNOWN_REGION
+    try {
+      val startNanos = System.nanoTime()
+      val firstNumbers = firstPhoneNumberPerContact(context)
+      val counts = HashMap<String, Int>()
+      for (iso in regionsOf(firstNumbers, region)) {
+        counts[iso] = (counts[iso] ?: 0) + 1
+      }
+      val elapsedMs = (System.nanoTime() - startNanos) / 1_000_000
+      // Counts and timing only, never the numbers themselves (PII, DCS-5281).
+      Log.d(
+        TAG,
+        "addressBookRegionCounts: ${firstNumbers.size} contacts, ${counts.size} regions in ${elapsedMs}ms",
+      )
+      result.success(mapOf("counts" to counts, "contacts" to firstNumbers.size))
+    } catch (e: Exception) {
+      // A provider failure must never take the caller down: null keeps its fallback.
+      Log.d(TAG, "addressBookRegionCounts failed: ${e.javaClass.simpleName}")
+      result.success(null)
+    }
+  }
+
+  private fun hasReadContactsPermission(context: Context): Boolean =
+    Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
+      context.checkSelfPermission(Manifest.permission.READ_CONTACTS) ==
+        PackageManager.PERMISSION_GRANTED
+
+  /**
+   * The first phone number of every contact, as the string the ranking parses.
+   *
+   * One query over the phone table, ordered so that the first row of each
+   * contact is its primary number, then its oldest one — the same "first
+   * number" flutter_contacts hands to Dart.
+   */
+  private fun firstPhoneNumberPerContact(context: Context): List<String> {
+    val projection = arrayOf(Phone.CONTACT_ID, Phone.NORMALIZED_NUMBER, Phone.NUMBER)
+    val order = "${Phone.CONTACT_ID} ASC, ${Phone.IS_PRIMARY} DESC, ${Phone._ID} ASC"
+    val numbers = ArrayList<String>()
+    val cursor = context.contentResolver.query(Phone.CONTENT_URI, projection, null, null, order)
+      ?: return numbers
+    cursor.use { c ->
+      val contactColumn = c.getColumnIndexOrThrow(Phone.CONTACT_ID)
+      val normalizedColumn = c.getColumnIndexOrThrow(Phone.NORMALIZED_NUMBER)
+      val rawColumn = c.getColumnIndexOrThrow(Phone.NUMBER)
+      var lastContact: String? = null
+      while (c.moveToNext()) {
+        val contact = c.getString(contactColumn)
+        if (contact == lastContact) continue // only the first number of a contact counts
+        lastContact = contact
+        val number = parseInput(c.getString(normalizedColumn), c.getString(rawColumn)) ?: continue
+        numbers.add(number)
+      }
+    }
+    return numbers
+  }
+
+  /**
+   * The string the Dart pipeline hands libphonenumber for this number, or null
+   * when it hands nothing (no digits at all).
+   *
+   * Dart keeps the provider's normalisation as the number's msisdn and parses
+   * that, else the raw number; its pre-parse keeps digits and a leading `+`;
+   * its `addPlusIfMissing` then takes a digit-led string without an exit code
+   * as international. A string with an exit code stays as is and is parsed
+   * under the user's region.
+   */
+  private fun parseInput(normalized: String?, raw: String?): String? {
+    val source = normalized?.takeIf { it.isNotBlank() } ?: raw ?: return null
+    val stripped = stripToMsisdn(source)
+    if (stripped.isEmpty()) return null
+    if (stripped.startsWith("+")) return stripped
+    return if (EXIT_CODES.any { stripped.startsWith(it) }) stripped else "+$stripped"
+  }
+
+  /**
+   * Digits and a leading `+`; `*` and `#` end the number; Arabic-Indic digits
+   * fold to ASCII. The Dart side's `idtm_stringByRemovingNonMSISDNCharacters`
+   * after its `replaceArabicNumber`.
+   */
+  private fun stripToMsisdn(value: String): String {
+    val out = StringBuilder(value.length)
+    for ((index, c) in value.withIndex()) {
+      when {
+        c == '*' || c == '#' -> break
+        c == '+' && index == 0 -> out.append(c)
+        c in '0'..'9' -> out.append(c)
+        c in '٠'..'٩' -> out.append('0' + (c - '٠'))
+      }
+    }
+    return out.toString()
+  }
+
+  /** Regions of [numbers] (region-less ones dropped), spread across [batchExecutor]. */
+  private fun regionsOf(numbers: List<String>, region: String): List<String> {
+    if (numbers.size < PARALLEL_BATCH_MINIMUM) {
+      return numbers.mapNotNull { regionOf(it, region) }
+    }
+    val tasks = numbers.chunked(REGION_CHUNK_SIZE).map { chunk ->
+      Callable { chunk.mapNotNull { regionOf(it, region) } }
+    }
+    return batchExecutor.invokeAll(tasks).flatMap { future -> future.get() }
+  }
+
+  /**
+   * Lowercase ISO region of [number] parsed under [region] (ignored by
+   * libphonenumber for a number with `+`), or null when it cannot be parsed.
+   * A parsed number with no region falls back to its calling code's main
+   * region, like the Dart dial-code table.
+   */
+  private fun regionOf(number: String, region: String): String? {
+    val parsed = try {
+      phoneUtil.parse(number, region)
+    } catch (e: Exception) {
+      return null // NumberParseException: no region, as in Dart
+    }
+    val iso = try {
+      phoneUtil.getRegionCodeForNumber(parsed)
+    } catch (e: Exception) {
+      null // the NPE it can raise for a number with no known region
+    } ?: phoneUtil.getRegionCodeForCountryCode(parsed.countryCode).takeIf { it != UNKNOWN_REGION }
+    return iso?.lowercase(Locale.ROOT)
   }
 
   /**
@@ -289,6 +468,22 @@ class LibphonenumberPlugin : FlutterPlugin, MethodCallHandler {
 
     /** Below this size a batch is resolved inline: pooling has no win to offer. */
     private const val PARALLEL_BATCH_MINIMUM = 64
+
+    /** Numbers per worker task in [regionsOf]: one parse each, so coarse tasks cost nothing. */
+    private const val REGION_CHUNK_SIZE = 128
+
+    /**
+     * libphonenumber's "unknown region": the parse region when the caller has
+     * none, and what [PhoneNumberUtil.getRegionCodeForCountryCode] answers for
+     * a calling code it does not know.
+     */
+    private const val UNKNOWN_REGION = "ZZ"
+
+    /**
+     * International exit codes the Dart side's `addPlusIfMissing` recognises:
+     * a digit-led number starting with one is dialled, not international.
+     */
+    private val EXIT_CODES = listOf("00", "0011", "000", "009", "011")
 
     /**
      * Workers for [numbersDetails] batches. libphonenumber's PhoneNumberUtil
